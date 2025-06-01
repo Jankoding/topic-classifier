@@ -5,6 +5,7 @@ from sentence_transformers import SentenceTransformer
 from transformers import pipeline, AutoTokenizer
 from sklearn.metrics.pairwise import cosine_similarity
 import nltk
+nltk.download('punkt_tab')
 from nltk.tokenize import sent_tokenize
 from concurrent.futures import ThreadPoolExecutor
 import gc
