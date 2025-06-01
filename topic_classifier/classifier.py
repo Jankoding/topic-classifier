@@ -8,6 +8,7 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
 nltk.download('punkt')
+nltk.download('punkt_tab')
 
 def run_classification(data_folder, output_folder, labels_file=None, topics_file=None):
     os.makedirs(output_folder, exist_ok=True)
