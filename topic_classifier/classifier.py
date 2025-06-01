@@ -1,68 +1,373 @@
 import os
 import torch
-from transformers import pipeline
+import numpy as np
 from sentence_transformers import SentenceTransformer
+from transformers import pipeline, AutoTokenizer
 from sklearn.metrics.pairwise import cosine_similarity
 import nltk
 from nltk.tokenize import sent_tokenize
+from concurrent.futures import ThreadPoolExecutor
+import gc
 
-nltk.download('punkt')
-
-def run_classification(data_folder, output_folder, labels_file, topics_file):
-    """
-    Classifies .txt files in `data_folder` and saves results to `output_folder`.
-    Expects user to provide:
-        - labels_file: path to a comma-separated .txt file
-        - topics_file: path to a file with 'topic: description' per line
-    """
-
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-
-    # Read candidate labels
-    with open(labels_file, 'r') as f:
-        candidate_labels = [label.strip() for label in f.read().split(',')]
-
-    # Read topic descriptions
-    with open(topics_file, 'r') as f:
-        lines = f.read().split('\n')
-        topic_descriptions = {}
-        for line in lines:
+def load_config_files(labels_file, topics_file):
+    """Load candidate labels and topic descriptions from files"""
+    # Load candidate labels
+    with open(labels_file, 'r', encoding='utf-8') as f:
+        candidate_labels = [line.strip() for line in f if line.strip()]
+    
+    # Load topic descriptions
+    topic_descriptions = {}
+    with open(topics_file, 'r', encoding='utf-8') as f:
+        for line in f:
             if ':' in line:
-                key, value = line.split(':', 1)
-                topic_descriptions[key.strip()] = value.strip()
+                topic, description = line.strip().split(':', 1)
+                topic_descriptions[topic.strip()] = description.strip()
+    
+    return candidate_labels, topic_descriptions
 
-    # Zero-shot classifier
-    device_id = 0 if torch.cuda.is_available() else -1
-    classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli", device=device_id)
+def batch_process_texts(texts, model_func, batch_size=8):
+    """Process texts in batches to maximize GPU utilization"""
+    results = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        batch_results = model_func(batch)
+        results.extend(batch_results)
+        
+        # Clear GPU cache between batches
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    return results
 
-    # Semantic model
-    semantic_model = SentenceTransformer("all-MiniLM-L6-v2", device='cuda' if torch.cuda.is_available() else 'cpu')
-    topic_embeddings = semantic_model.encode(list(topic_descriptions.values()), show_progress_bar=False)
+def prepare_text_chunks(text, tokenizer, max_chunk_tokens=850):
+    """Prepare text chunks for processing"""
+    sentences = sent_tokenize(text)
+    chunks = []
+    current_chunk = ""
+    current_tokens = 0
 
-    for fname in os.listdir(data_folder):
-        if not fname.endswith('.txt'):
+    for sentence in sentences:
+        token_count = len(tokenizer.tokenize(sentence))
+        
+        if current_tokens + token_count > max_chunk_tokens:
+            if current_chunk.strip():
+                chunks.append(current_chunk.strip())
+            current_chunk = sentence
+            current_tokens = token_count
+        else:
+            current_chunk += " " + sentence
+            current_tokens += token_count
+
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+def batch_zero_shot_classification(file_data_list, candidate_labels, device_id=0, batch_size=4):
+    """Perform zero-shot classification on multiple files with GPU batching"""
+    classifier = pipeline(
+        "zero-shot-classification", 
+        model="facebook/bart-large-mnli", 
+        device=device_id,
+        batch_size=batch_size  # Enable batch processing
+    )
+    tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large-mnli")
+    
+    results = []
+    
+    # Prepare all chunks from all files
+    all_chunks = []
+    chunk_to_file_mapping = []
+    
+    for file_idx, (file_name, text) in enumerate(file_data_list):
+        chunks = prepare_text_chunks(text, tokenizer)
+        all_chunks.extend(chunks)
+        chunk_to_file_mapping.extend([file_idx] * len(chunks))
+        print(f"File {file_name}: {len(chunks)} chunks prepared")
+    
+    print(f"Processing {len(all_chunks)} total chunks in batches of {batch_size}...")
+    
+    # Process all chunks in batches
+    chunk_results = []
+    for i in range(0, len(all_chunks), batch_size):
+        batch_chunks = all_chunks[i:i + batch_size]
+        try:
+            # Process batch
+            batch_outputs = classifier(batch_chunks, candidate_labels)
+            chunk_results.extend(batch_outputs)
+            print(f"Processed batch {i//batch_size + 1}/{(len(all_chunks) + batch_size - 1)//batch_size}")
+        except Exception as e:
+            print(f"Error processing batch starting at {i}: {e}")
+            # Add dummy results for failed batch
+            chunk_results.extend([None] * len(batch_chunks))
+    
+    # Aggregate results by file
+    file_chunk_counts = []
+    chunk_idx = 0
+    
+    for file_idx, (file_name, text) in enumerate(file_data_list):
+        file_chunks = prepare_text_chunks(text, tokenizer)
+        num_chunks = len(file_chunks)
+        file_chunk_counts.append(num_chunks)
+        
+        # Get chunk results for this file
+        file_chunk_results = chunk_results[chunk_idx:chunk_idx + num_chunks]
+        chunk_idx += num_chunks
+        
+        # Filter out failed chunks
+        valid_results = [r for r in file_chunk_results if r is not None]
+        
+        if not valid_results:
+            # Fallback for files with no successful chunks
+            summary_text = text[:500] + "..." + text[-500:] if len(text) > 1000 else text
+            try:
+                fallback_result = classifier(summary_text, candidate_labels)
+                results.append({
+                    'labels': fallback_result['labels'],
+                    'scores': fallback_result['scores'],
+                    'chunks_processed': 1,
+                    'fallback_used': True
+                })
+            except:
+                # Ultimate fallback
+                results.append({
+                    'labels': candidate_labels,
+                    'scores': [0.0] * len(candidate_labels),
+                    'chunks_processed': 0,
+                    'fallback_used': True
+                })
             continue
+        
+        # Aggregate chunk results
+        label_scores = {}
+        for result in valid_results:
+            for label, score in zip(result['labels'], result['scores']):
+                if label not in label_scores:
+                    label_scores[label] = []
+                label_scores[label].append(score)
 
-        with open(os.path.join(data_folder, fname), 'r', encoding='utf-8') as f:
+        # Calculate average scores
+        aggregated_scores = {
+            label: sum(scores) / len(scores) for label, scores in label_scores.items()
+        }
+
+        # Sort by score
+        sorted_labels = sorted(aggregated_scores.items(), key=lambda x: x[1], reverse=True)
+
+        results.append({
+            'labels': [label for label, score in sorted_labels],
+            'scores': [score for label, score in sorted_labels],
+            'chunks_processed': len(valid_results)
+        })
+    
+    return results
+
+def batch_semantic_similarity(file_data_list, topic_descriptions, device='cuda', batch_size=16):
+    """Perform semantic similarity on multiple files with GPU batching"""
+    model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+    
+    # Prepare topic data
+    topics = list(topic_descriptions.keys())
+    topic_texts = list(topic_descriptions.values())
+    
+    # Encode topic descriptions once
+    print("Encoding topic descriptions...")
+    topic_embeddings = model.encode(topic_texts, batch_size=batch_size, show_progress_bar=True)
+    
+    # Prepare all document texts
+    all_texts = [text for _, text in file_data_list]
+    
+    # Encode all documents in batches
+    print(f"Encoding {len(all_texts)} documents...")
+    doc_embeddings = model.encode(all_texts, batch_size=batch_size, show_progress_bar=True)
+    
+    # Calculate similarities for all documents at once
+    print("Calculating similarities...")
+    all_similarities = cosine_similarity(doc_embeddings, topic_embeddings)
+    
+    # Process results
+    results = []
+    for i, similarities in enumerate(all_similarities):
+        topic_scores = list(zip(topics, similarities))
+        topic_scores.sort(key=lambda x: x[1], reverse=True)
+        
+        results.append({
+            'labels': [topic for topic, _ in topic_scores],
+            'scores': [score for _, score in topic_scores]
+        })
+    
+    return results
+
+def write_detailed_results(file_name, text, zero_shot_result, semantic_result, output_path):
+    """Write detailed classification results with explanations and metadata"""
+    
+    with open(output_path, 'w', encoding='utf-8') as f_out:
+        # File metadata
+        f_out.write(f"File: {file_name}\n")
+        f_out.write(f"Text length: {len(text)} characters\n")
+        
+        # Chunking info if available
+        if 'chunks_processed' in zero_shot_result:
+            f_out.write(f"Chunks processed: {zero_shot_result['chunks_processed']}\n")
+            if zero_shot_result.get('fallback_used', False):
+                f_out.write("⚠️  Fallback processing used due to chunk processing errors\n")
+        
+        f_out.write("\n" + "="*50 + "\n")
+        f_out.write("ZERO-SHOT CLASSIFICATION\n")
+        f_out.write("="*50 + "\n")
+        
+        # Primary topic with confidence assessment
+        primary_score = zero_shot_result['scores'][0]
+        if primary_score >= 0.7:
+            confidence_level = "HIGH"
+        elif primary_score >= 0.4:
+            confidence_level = "MODERATE"
+        elif primary_score >= 0.2:
+            confidence_level = "LOW"
+        else:
+            confidence_level = "VERY LOW"
+        
+        f_out.write(f"Primary topic: {zero_shot_result['labels'][0]} (confidence: {primary_score:.3f} - {confidence_level})\n\n")
+        
+        # Warning for low confidence
+        if primary_score < 0.4:
+            f_out.write(f"⚠️  WARNING: Low confidence classification. Document may not fit well into predefined categories.\n\n")
+        
+        # Top 5 topics with relevance indicators
+        f_out.write("Top 5 topics:\n")
+        for label, score in zip(zero_shot_result['labels'][:5], zero_shot_result['scores'][:5]):
+            if score >= 0.4:
+                confidence_indicator = "✓ RELEVANT"
+            elif score >= 0.2:
+                confidence_indicator = "~ MAYBE"
+            else:
+                confidence_indicator = "✗ UNLIKELY"
+            f_out.write(f"  - {label}: {score:.3f} ({confidence_indicator})\n")
+        
+        # Confident predictions summary
+        confident_topics = [(label, score) for label, score in zip(zero_shot_result['labels'], zero_shot_result['scores']) if score >= 0.4]
+        if len(confident_topics) > 1:
+            f_out.write(f"\nConfident predictions (≥0.4): {', '.join([label for label, _ in confident_topics])}\n")
+        elif len(confident_topics) == 0:
+            f_out.write(f"\nNo confident predictions found. This document may need manual categorization.\n")
+        
+        f_out.write("\n" + "="*50 + "\n")
+        f_out.write("SEMANTIC SIMILARITY\n")
+        f_out.write("="*50 + "\n")
+        
+        # Semantic results with similarity assessment
+        semantic_primary_score = semantic_result['scores'][0]
+        if semantic_primary_score >= 0.5:
+            semantic_confidence = "HIGH"
+        elif semantic_primary_score >= 0.3:
+            semantic_confidence = "MODERATE"
+        elif semantic_primary_score >= 0.15:
+            semantic_confidence = "LOW"
+        else:
+            semantic_confidence = "VERY LOW"
+            
+        f_out.write(f"Primary topic: {semantic_result['labels'][0]} (similarity: {semantic_primary_score:.3f} - {semantic_confidence})\n\n")
+        
+        f_out.write("Top 5 topics:\n")
+        for label, score in zip(semantic_result['labels'][:5], semantic_result['scores'][:5]):
+            if score >= 0.3:
+                similarity_indicator = "✓ STRONG MATCH"
+            elif score >= 0.15:
+                similarity_indicator = "~ WEAK MATCH"
+            else:
+                similarity_indicator = "✗ POOR MATCH"
+            f_out.write(f"  - {label}: {score:.3f} ({similarity_indicator})\n")
+
+def run_classification(data_folder, output_folder, labels_file, topics_file, 
+                      zero_shot_batch_size=4, semantic_batch_size=16):
+    """
+    Run GPU-optimized batch topic classification
+    
+    Args:
+        data_folder: Path to folder containing .txt files
+        output_folder: Path to output folder for results
+        labels_file: Path to file containing candidate labels (one per line)
+        topics_file: Path to file containing topic descriptions (format: topic: description)
+        zero_shot_batch_size: Batch size for zero-shot classification (smaller due to memory)
+        semantic_batch_size: Batch size for semantic similarity (can be larger)
+    """
+    
+    # Setup
+    os.makedirs(output_folder, exist_ok=True)
+    nltk.download('punkt', quiet=True)
+    
+    # Check GPU
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device_id = 0 if torch.cuda.is_available() else -1
+    print(f"Using device: {device}")
+    
+    # Load configuration
+    candidate_labels, topic_descriptions = load_config_files(labels_file, topics_file)
+    print(f"Loaded {len(candidate_labels)} candidate labels and {len(topic_descriptions)} topic descriptions")
+    
+    # Load all files
+    file_names = [f for f in os.listdir(data_folder) if f.endswith('.txt')]
+    print(f"Found {len(file_names)} text files to process")
+    
+    # Read all files
+    file_data_list = []
+    for file_name in file_names:
+        with open(os.path.join(data_folder, file_name), 'r', encoding='utf-8') as f:
             text = f.read()
-
-        # Zero-shot (first 1000 chars to reduce cost)
-        zero_result = classifier(text[:1000], candidate_labels)
-
-        # Semantic similarity
-        doc_embedding = semantic_model.encode([text])
-        scores = cosine_similarity(doc_embedding, topic_embeddings)[0]
-        semantic_sorted = sorted(zip(topic_descriptions.keys(), scores), key=lambda x: x[1], reverse=True)
-
-        # Save
-        with open(os.path.join(output_folder, f"result_{fname}"), 'w', encoding='utf-8') as out:
-            out.write("Zero-Shot Classification:\n")
-            for label, score in zip(zero_result['labels'][:5], zero_result['scores'][:5]):
-                out.write(f"- {label}: {score:.3f}\n")
-
-            out.write("\nSemantic Similarity:\n")
-            for label, score in semantic_sorted[:5]:
-                out.write(f"- {label}: {score:.3f}\n")
-
-        print(f"Processed: {fname}")
+        file_data_list.append((file_name, text))
+    
+    print("Starting batch processing...")
+    
+    # Run zero-shot classification in batches
+    print("\n1. Running zero-shot classification...")
+    zero_shot_results = batch_zero_shot_classification(
+        file_data_list, candidate_labels, device_id, zero_shot_batch_size
+    )
+    
+    # Clear GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+    
+    # Run semantic similarity in batches
+    print("\n2. Running semantic similarity...")
+    semantic_results = batch_semantic_similarity(
+        file_data_list, topic_descriptions, device, semantic_batch_size
+    )
+    
+    # Write results
+    print("\n3. Writing detailed results...")
+    for i, (file_name, text) in enumerate(file_data_list):
+        output_path = os.path.join(output_folder, f"result_{file_name}")
+        write_detailed_results(
+            file_name, text, zero_shot_results[i], semantic_results[i], output_path
+        )
+    
+    # Create summary
+    summary_path = os.path.join(output_folder, "classification_summary.txt")
+    with open(summary_path, 'w', encoding='utf-8') as summary_file:
+        summary_file.write("GPU BATCH TOPIC CLASSIFICATION SUMMARY\n")
+        summary_file.write("="*60 + "\n\n")
+        summary_file.write(f"Processed {len(file_names)} files using {device.upper()}\n")
+        summary_file.write(f"Zero-shot batch size: {zero_shot_batch_size}\n")
+        summary_file.write(f"Semantic batch size: {semantic_batch_size}\n\n")
+        
+        for i, (file_name, _) in enumerate(file_data_list):
+            summary_file.write(f"File: {file_name}\n")
+            summary_file.write("-" * (len(file_name) + 6) + "\n")
+            
+            # Zero-shot primary topic
+            zs_primary = zero_shot_results[i]['labels'][0]
+            zs_score = zero_shot_results[i]['scores'][0]
+            summary_file.write(f"Zero-shot: {zs_primary} ({zs_score:.3f})\n")
+            
+            # Semantic primary topic
+            sem_primary = semantic_results[i]['labels'][0]
+            sem_score = semantic_results[i]['scores'][0]
+            summary_file.write(f"Semantic: {sem_primary} ({sem_score:.3f})\n\n")
+    
+    print(f"\n✅ Processing complete!")
+    print(f"Results saved in: {output_folder}")
+    print("Files generated:")
+    print("- result_*.txt: Detailed classification results for each file")
+    print("- classification_summary.txt: Batch processing summary")
