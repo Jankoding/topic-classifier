@@ -5,7 +5,7 @@ from sentence_transformers import SentenceTransformer
 from transformers import pipeline, AutoTokenizer
 from sklearn.metrics.pairwise import cosine_similarity
 import nltk
-nltk.download('punkt_tab')
+nltk.download('punkt')
 from nltk.tokenize import sent_tokenize
 from concurrent.futures import ThreadPoolExecutor
 import gc
@@ -199,26 +199,21 @@ def batch_semantic_similarity(file_data_list, topic_descriptions, device='cuda',
     
     return results
 
-def write_detailed_results(file_name, text, zero_shot_result, semantic_result, output_path):
-    """Write detailed classification results with explanations and metadata"""
-    
+def write_zero_shot_results(file_name, text, result, output_path):
+    """Write zero-shot classification results in the specified format"""
     with open(output_path, 'w', encoding='utf-8') as f_out:
         # File metadata
         f_out.write(f"File: {file_name}\n")
         f_out.write(f"Text length: {len(text)} characters\n")
         
         # Chunking info if available
-        if 'chunks_processed' in zero_shot_result:
-            f_out.write(f"Chunks processed: {zero_shot_result['chunks_processed']}\n")
-            if zero_shot_result.get('fallback_used', False):
+        if 'chunks_processed' in result:
+            f_out.write(f"Chunks processed: {result['chunks_processed']}\n")
+            if result.get('fallback_used', False):
                 f_out.write("⚠️  Fallback processing used due to chunk processing errors\n")
         
-        f_out.write("\n" + "="*50 + "\n")
-        f_out.write("ZERO-SHOT CLASSIFICATION\n")
-        f_out.write("="*50 + "\n")
-        
         # Primary topic with confidence assessment
-        primary_score = zero_shot_result['scores'][0]
+        primary_score = result['scores'][0]
         if primary_score >= 0.7:
             confidence_level = "HIGH"
         elif primary_score >= 0.4:
@@ -228,15 +223,15 @@ def write_detailed_results(file_name, text, zero_shot_result, semantic_result, o
         else:
             confidence_level = "VERY LOW"
         
-        f_out.write(f"Primary topic: {zero_shot_result['labels'][0]} (confidence: {primary_score:.3f} - {confidence_level})\n\n")
+        f_out.write(f"Primary topic: {result['labels'][0]} (confidence: {primary_score:.3f} - {confidence_level})\n")
         
         # Warning for low confidence
         if primary_score < 0.4:
-            f_out.write(f"⚠️  WARNING: Low confidence classification. Document may not fit well into predefined categories.\n\n")
+            f_out.write(f"⚠️  WARNING: Low confidence classification. Document may not fit well into predefined categories.\n")
         
         # Top 5 topics with relevance indicators
-        f_out.write("Top 5 topics:\n")
-        for label, score in zip(zero_shot_result['labels'][:5], zero_shot_result['scores'][:5]):
+        f_out.write("\nTop 5 topics:\n")
+        for label, score in zip(result['labels'][:5], result['scores'][:5]):
             if score >= 0.4:
                 confidence_indicator = "✓ RELEVANT"
             elif score >= 0.2:
@@ -246,38 +241,25 @@ def write_detailed_results(file_name, text, zero_shot_result, semantic_result, o
             f_out.write(f"  - {label}: {score:.3f} ({confidence_indicator})\n")
         
         # Confident predictions summary
-        confident_topics = [(label, score) for label, score in zip(zero_shot_result['labels'], zero_shot_result['scores']) if score >= 0.4]
+        confident_topics = [(label, score) for label, score in zip(result['labels'], result['scores']) if score >= 0.4]
         if len(confident_topics) > 1:
             f_out.write(f"\nConfident predictions (≥0.4): {', '.join([label for label, _ in confident_topics])}\n")
         elif len(confident_topics) == 0:
             f_out.write(f"\nNo confident predictions found. This document may need manual categorization.\n")
+
+def write_semantic_results(file_name, result, output_path):
+    """Write semantic similarity results in the specified format"""
+    with open(output_path, 'w', encoding='utf-8') as f_out:
+        f_out.write(f"File: {file_name}\n")
         
-        f_out.write("\n" + "="*50 + "\n")
-        f_out.write("SEMANTIC SIMILARITY\n")
-        f_out.write("="*50 + "\n")
+        # Primary topic with similarity score
+        primary_score = result['scores'][0]
+        f_out.write(f"Primary topic: {result['labels'][0]} (similarity: {primary_score:.3f})\n")
         
-        # Semantic results with similarity assessment
-        semantic_primary_score = semantic_result['scores'][0]
-        if semantic_primary_score >= 0.5:
-            semantic_confidence = "HIGH"
-        elif semantic_primary_score >= 0.3:
-            semantic_confidence = "MODERATE"
-        elif semantic_primary_score >= 0.15:
-            semantic_confidence = "LOW"
-        else:
-            semantic_confidence = "VERY LOW"
-            
-        f_out.write(f"Primary topic: {semantic_result['labels'][0]} (similarity: {semantic_primary_score:.3f} - {semantic_confidence})\n\n")
-        
+        # Top 5 topics
         f_out.write("Top 5 topics:\n")
-        for label, score in zip(semantic_result['labels'][:5], semantic_result['scores'][:5]):
-            if score >= 0.3:
-                similarity_indicator = "✓ STRONG MATCH"
-            elif score >= 0.15:
-                similarity_indicator = "~ WEAK MATCH"
-            else:
-                similarity_indicator = "✗ POOR MATCH"
-            f_out.write(f"  - {label}: {score:.3f} ({similarity_indicator})\n")
+        for label, score in zip(result['labels'][:5], result['scores'][:5]):
+            f_out.write(f"  - {label}: {score:.3f}\n")
 
 def run_classification(data_folder, output_folder, labels_file, topics_file, 
                       zero_shot_batch_size=4, semantic_batch_size=16):
@@ -336,13 +318,16 @@ def run_classification(data_folder, output_folder, labels_file, topics_file,
         file_data_list, topic_descriptions, device, semantic_batch_size
     )
     
-    # Write results
-    print("\n3. Writing detailed results...")
+    # Write results in separate files for each method
+    print("\n3. Writing results...")
     for i, (file_name, text) in enumerate(file_data_list):
-        output_path = os.path.join(output_folder, f"result_{file_name}")
-        write_detailed_results(
-            file_name, text, zero_shot_results[i], semantic_results[i], output_path
-        )
+        # Write zero-shot results
+        zero_shot_path = os.path.join(output_folder, f"zero_shot_{file_name}")
+        write_zero_shot_results(file_name, text, zero_shot_results[i], zero_shot_path)
+        
+        # Write semantic results
+        semantic_path = os.path.join(output_folder, f"semantic_{file_name}")
+        write_semantic_results(file_name, semantic_results[i], semantic_path)
     
     # Create summary
     summary_path = os.path.join(output_folder, "classification_summary.txt")
@@ -370,5 +355,17 @@ def run_classification(data_folder, output_folder, labels_file, topics_file,
     print(f"\n✅ Processing complete!")
     print(f"Results saved in: {output_folder}")
     print("Files generated:")
-    print("- result_*.txt: Detailed classification results for each file")
+    print("- zero_shot_*.txt: Zero-shot classification results")
+    print("- semantic_*.txt: Semantic similarity results")
     print("- classification_summary.txt: Batch processing summary")
+
+if __name__ == "__main__":
+    # Example usage
+    run_classification(
+        data_folder="./data",
+        output_folder="./results",
+        labels_file="./config/labels.txt",
+        topics_file="./config/topics.txt",
+        zero_shot_batch_size=4,
+        semantic_batch_size=16
+    )
