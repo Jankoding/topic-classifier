@@ -63,7 +63,7 @@ def prepare_text_chunks(text, tokenizer, max_chunk_tokens=850):
         chunks.append(current_chunk.strip())
 
     return chunks
-
+    
 def batch_zero_shot_classification(file_data_list, candidate_labels, device_id=0, batch_size=4):
     """Perform zero-shot classification on multiple files with GPU batching"""
     classifier = pipeline(
@@ -100,7 +100,7 @@ def batch_zero_shot_classification(file_data_list, candidate_labels, device_id=0
         except Exception as e:
             print(f"Error processing batch starting at {i}: {e}")
             # Add dummy results for failed batch
-            chunk_results.extend([None] * len(batch_chunks))
+            chunk_results.extend([{'labels': candidate_labels, 'scores': [0.0]*len(candidate_labels)} for _ in range(len(batch_chunks))])
     
     # Aggregate results by file
     file_chunk_counts = []
@@ -115,50 +115,37 @@ def batch_zero_shot_classification(file_data_list, candidate_labels, device_id=0
         file_chunk_results = chunk_results[chunk_idx:chunk_idx + num_chunks]
         chunk_idx += num_chunks
         
-        # Filter out failed chunks
-        valid_results = [r for r in file_chunk_results if r is not None]
+        # Initialize score accumulators for each label
+        label_scores = {label: [] for label in candidate_labels}
         
-        if not valid_results:
-            # Fallback for files with no successful chunks
-            summary_text = text[:500] + "..." + text[-500:] if len(text) > 1000 else text
-            try:
-                fallback_result = classifier(summary_text, candidate_labels)
-                results.append({
-                    'labels': fallback_result['labels'],
-                    'scores': fallback_result['scores'],
-                    'chunks_processed': 1,
-                    'fallback_used': True
-                })
-            except:
-                # Ultimate fallback
-                results.append({
-                    'labels': candidate_labels,
-                    'scores': [0.0] * len(candidate_labels),
-                    'chunks_processed': 0,
-                    'fallback_used': True
-                })
-            continue
-        
-        # Aggregate chunk results
-        label_scores = {}
-        for result in valid_results:
-            for label, score in zip(result['labels'], result['scores']):
-                if label not in label_scores:
-                    label_scores[label] = []
+        # Collect scores for each label across all chunks
+        for result in file_chunk_results:
+            # Create mapping from label to score for this chunk
+            chunk_label_scores = dict(zip(result['labels'], result['scores']))
+            
+            # For each candidate label, get its score (or 0 if not present)
+            for label in candidate_labels:
+                score = chunk_label_scores.get(label, 0.0)
                 label_scores[label].append(score)
-
-        # Calculate average scores
+        
+        # Calculate average scores for each label
         aggregated_scores = {
-            label: sum(scores) / len(scores) for label, scores in label_scores.items()
+            label: sum(scores)/len(scores) if scores else 0.0
+            for label, scores in label_scores.items()
         }
-
-        # Sort by score
-        sorted_labels = sorted(aggregated_scores.items(), key=lambda x: x[1], reverse=True)
-
+        
+        # Sort labels by average score
+        sorted_labels = sorted(
+            aggregated_scores.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        
         results.append({
             'labels': [label for label, score in sorted_labels],
             'scores': [score for label, score in sorted_labels],
-            'chunks_processed': len(valid_results)
+            'chunks_processed': len(file_chunk_results),
+            'fallback_used': False
         })
     
     return results
