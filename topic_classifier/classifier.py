@@ -120,43 +120,54 @@ def batch_zero_shot_classification(file_data_list, candidate_labels, device_id=0
         file_chunk_results = chunk_results[chunk_idx:chunk_idx + num_chunks]
         chunk_idx += num_chunks
         
-        # Initialize score accumulators for each label
-        label_scores = {label: [] for label in candidate_labels}
+        # Filter out failed chunks
+        valid_results = [r for r in file_chunk_results if r is not None]
         
-        # Collect scores for each label across all chunks
-        for result in file_chunk_results:
-            # Ensure the labels and scores are in the same order as candidate_labels
-            ordered_scores = []
-            for label in candidate_labels:
-                try:
-                    idx = result['labels'].index(label)
-                    ordered_scores.append(result['scores'][idx])
-                except ValueError:
-                    ordered_scores.append(0.0)
-            
-            # Add scores to our accumulators
-            for label, score in zip(candidate_labels, ordered_scores):
+        if not valid_results:
+            # Fallback for files with no successful chunks
+            summary_text = text[:500] + "..." + text[-500:] if len(text) > 1000 else text
+            try:
+                fallback_result = classifier(summary_text, candidate_labels)
+                results.append({
+                    'labels': fallback_result['labels'],
+                    'scores': fallback_result['scores'],
+                    'chunks_processed': 1,
+                    'fallback_used': True
+                })
+            except:
+                # Ultimate fallback
+                results.append({
+                    'labels': candidate_labels,
+                    'scores': [0.0] * len(candidate_labels),
+                    'chunks_processed': 0,
+                    'fallback_used': True
+                })
+            continue
+        
+        # Aggregate chunk results
+        label_scores = {}
+        for result in valid_results:
+            for label, score in zip(result['labels'], result['scores']):
+                if label not in label_scores:
+                    label_scores[label] = []
                 label_scores[label].append(score)
-        
-        # Calculate average scores for each label
+
+        # Calculate average scores
         aggregated_scores = {
-            label: sum(scores)/len(scores) if scores else 0.0
-            for label, scores in label_scores.items()
+            label: sum(scores) / len(scores) for label, scores in label_scores.items()
+        }
+
+        # Sort labels by score
+        sorted_labels = sorted(aggregated_scores.items(), key=lambda x: x[1], reverse=True)
+
+        # Create result dictionary with sorted labels and scores
+        result = {
+            'labels': [label for label, score in sorted_labels],
+            'scores': [score for label, score in sorted_labels],
+            'chunks_processed': len(valid_results)
         }
         
-        # Sort labels by average score
-        sorted_labels = sorted(
-            aggregated_scores.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )
-        
-        results.append({
-            'labels': [label for label, _ in sorted_labels],
-            'scores': [score for _, score in sorted_labels],
-            'chunks_processed': len(file_chunk_results),
-            'fallback_used': False
-        })
+        results.append(result)
     
     return results
     
@@ -226,23 +237,25 @@ def write_zero_shot_results(file_name, text, result, output_path):
         if primary_score < 0.4:
             f_out.write(f"⚠️  WARNING: Low confidence classification. Document may not fit well into predefined categories.\n")
         
-        # Top 5 topics with relevance indicators
-        f_out.write("\nTop 5 topics:\n")
-        for label, score in zip(result['labels'][:5], result['scores'][:5]):
-            if score >= 0.4:
-                confidence_indicator = "✓ RELEVANT"
-            elif score >= 0.2:
-                confidence_indicator = "~ MAYBE"
-            else:
-                confidence_indicator = "✗ UNLIKELY"
-            f_out.write(f"  - {label}: {score:.3f} ({confidence_indicator})\n")
-        
-        # Confident predictions summary
-        confident_topics = [(label, score) for label, score in zip(result['labels'], result['scores']) if score >= 0.4]
-        if len(confident_topics) > 1:
-            f_out.write(f"\nConfident predictions (≥0.4): {', '.join([label for label, _ in confident_topics])}\n")
-        elif len(confident_topics) == 0:
-            f_out.write(f"\nNo confident predictions found. This document may need manual categorization.\n")
+    # Top 5 topics with relevance indicators
+    f_out.write("\nTop 5 topics:\n")
+    top_labels = result['labels'][:5]
+    top_scores = result['scores'][:5]
+    for label, score in zip(top_labels, top_scores):
+        if score >= 0.4:
+            confidence_indicator = "✓ RELEVANT"
+        elif score >= 0.2:
+            confidence_indicator = "~ MAYBE"
+        else:
+            confidence_indicator = "✗ UNLIKELY"
+        f_out.write(f"  - {label}: {score:.3f} ({confidence_indicator})\n")
+
+    # Show only confident predictions
+    confident_topics = [(label, score) for label, score in zip(result['labels'], result['scores']) if score >= 0.4]
+    if len(confident_topics) > 1:
+        f_out.write(f"\nConfident predictions (≥0.4): {', '.join([label for label, _ in confident_topics])}\n")
+    elif len(confident_topics) == 0:
+        f_out.write(f"\nNo confident predictions found. This document may need manual categorization.\n")
 
 def write_semantic_results(file_name, result, output_path):
     """Write semantic similarity results in the specified format"""
