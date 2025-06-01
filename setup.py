@@ -13,7 +13,7 @@ setup(
         'torch',
     ],
     description='Topic classification using zero-shot and semantic similarity',
-    author='Your Name',
+    author='A. Janada',
     url='https://github.com/yourusername/topic-classifier',
     classifiers=[
         'Programming Language :: Python :: 3',
