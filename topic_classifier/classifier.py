@@ -70,7 +70,8 @@ def batch_zero_shot_classification(file_data_list, candidate_labels, device_id=0
         "zero-shot-classification", 
         model="facebook/bart-large-mnli", 
         device=device_id,
-        batch_size=batch_size  # Enable batch processing
+        batch_size=batch_size,
+        multi_label=True  # This is crucial for individual label scoring
     )
     tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large-mnli")
     
@@ -93,14 +94,18 @@ def batch_zero_shot_classification(file_data_list, candidate_labels, device_id=0
     for i in range(0, len(all_chunks), batch_size):
         batch_chunks = all_chunks[i:i + batch_size]
         try:
-            # Process batch
-            batch_outputs = classifier(batch_chunks, candidate_labels)
+            # Process batch with multi_label=True to get individual scores
+            batch_outputs = classifier(batch_chunks, candidate_labels, multi_label=True)
             chunk_results.extend(batch_outputs)
             print(f"Processed batch {i//batch_size + 1}/{(len(all_chunks) + batch_size - 1)//batch_size}")
         except Exception as e:
             print(f"Error processing batch starting at {i}: {e}")
-            # Add dummy results for failed batch
-            chunk_results.extend([{'labels': candidate_labels, 'scores': [0.0]*len(candidate_labels)} for _ in range(len(batch_chunks))])
+            # Add dummy results with zero scores for all labels
+            dummy_result = {
+                'labels': candidate_labels,
+                'scores': [0.0] * len(candidate_labels)
+            }
+            chunk_results.extend([dummy_result] * len(batch_chunks))
     
     # Aggregate results by file
     file_chunk_counts = []
@@ -120,12 +125,17 @@ def batch_zero_shot_classification(file_data_list, candidate_labels, device_id=0
         
         # Collect scores for each label across all chunks
         for result in file_chunk_results:
-            # Create mapping from label to score for this chunk
-            chunk_label_scores = dict(zip(result['labels'], result['scores']))
-            
-            # For each candidate label, get its score (or 0 if not present)
+            # Ensure the labels and scores are in the same order as candidate_labels
+            ordered_scores = []
             for label in candidate_labels:
-                score = chunk_label_scores.get(label, 0.0)
+                try:
+                    idx = result['labels'].index(label)
+                    ordered_scores.append(result['scores'][idx])
+                except ValueError:
+                    ordered_scores.append(0.0)
+            
+            # Add scores to our accumulators
+            for label, score in zip(candidate_labels, ordered_scores):
                 label_scores[label].append(score)
         
         # Calculate average scores for each label
@@ -142,14 +152,14 @@ def batch_zero_shot_classification(file_data_list, candidate_labels, device_id=0
         )
         
         results.append({
-            'labels': [label for label, score in sorted_labels],
-            'scores': [score for label, score in sorted_labels],
+            'labels': [label for label, _ in sorted_labels],
+            'scores': [score for _, score in sorted_labels],
             'chunks_processed': len(file_chunk_results),
             'fallback_used': False
         })
     
     return results
-
+    
 def batch_semantic_similarity(file_data_list, topic_descriptions, device='cuda', batch_size=16):
     """Perform semantic similarity on multiple files with GPU batching"""
     model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
